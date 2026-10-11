@@ -1,0 +1,98 @@
+# ---------------------------------------------------------------------------
+# TradingBot configuration
+# mode: paper  -> simulated account, no real orders (DEFAULT, start here)
+# mode: live   -> real orders via the brokers below; also needs --confirm-live
+# ---------------------------------------------------------------------------
+mode: paper
+timeframe: 1h          # bar size used for analysis: 5m 15m 30m 1h 4h 1d
+loop_seconds: 300      # how often the bot wakes up to re-analyze
+history_bars: 400
+starting_cash: 10000   # paper account size (USD)
+state_dir: state
+
+# Which venue executes each asset class in live mode.
+#   oanda -> OANDA v20 (XAU/USD + forex)   env: OANDA_API_KEY, OANDA_ACCOUNT_ID, OANDA_ENV
+#   ccxt  -> any CCXT crypto exchange       env: CCXT_EXCHANGE, CCXT_API_KEY, CCXT_SECRET
+brokers:
+  metal: oanda
+  forex: oanda
+  crypto: ccxt
+
+risk:
+  risk_per_trade: 0.01        # lose at most 1% of equity per trade
+  atr_stop_mult: 2.0          # stop-loss 2x ATR away
+  reward_risk: 2.0            # take-profit at 2x the stop distance
+  trailing_atr_mult: 2.5      # trailing stop (0 = off)
+  max_open_positions: 4
+  max_positions_per_class: 2
+  max_daily_loss: 0.03        # stop opening trades for the day after -3%
+  max_drawdown: 0.15          # stop opening trades entirely after -15% from peak
+  max_leverage: {crypto: 2.0, forex: 10.0, metal: 5.0}
+
+ensemble:
+  weights: {technical: 0.6, news: 0.25, positioning: 0.15}
+  entry_threshold: 0.35       # blended score needed to open (-1..+1)
+  exit_threshold: 0.10        # close when the score flips past this against us
+
+news:
+  enabled: true
+  half_life_hours: 6          # older headlines count less
+  # feeds: [...]              # override the default RSS list
+
+positioning:
+  enabled: true               # CFTC COT for gold/FX, OKX trader data for crypto
+
+instruments:
+  - name: XAU/USD
+    asset_class: metal
+    data_source: yahoo
+    data_symbol: GC=F          # COMEX gold futures as the price proxy
+    broker_symbol: XAU_USD
+    cot_code: "088691"
+    qty_step: 1
+    min_qty: 1
+
+  - name: EUR/USD
+    asset_class: forex
+    data_source: yahoo
+    data_symbol: EURUSD=X
+    broker_symbol: EUR_USD
+    cot_code: "099741"
+    qty_step: 1
+    min_qty: 1
+
+  - name: GBP/USD
+    asset_class: forex
+    data_source: yahoo
+    data_symbol: GBPUSD=X
+    broker_symbol: GBP_USD
+    cot_code: "096742"
+    qty_step: 1
+    min_qty: 1
+
+  - name: USD/JPY
+    asset_class: forex
+    data_source: yahoo
+    data_symbol: JPY=X
+    broker_symbol: USD_JPY
+    cot_code: "097741"
+    qty_step: 1
+    min_qty: 1
+
+  - name: BTC/USD
+    asset_class: crypto
+    data_source: okx
+    data_symbol: BTC-USDT
+    broker_symbol: BTC/USDT
+    okx_swap: BTC-USDT-SWAP
+    qty_step: 0.0001
+    min_qty: 0.0001
+
+  - name: ETH/USD
+    asset_class: crypto
+    data_source: okx
+    data_symbol: ETH-USDT
+    broker_symbol: ETH/USDT
+    okx_swap: ETH-USDT-SWAP
+    qty_step: 0.001
+    min_qty: 0.001

@@ -12,9 +12,9 @@ import pandas as pd
 
 from . import indicators as ind
 from .brokers.paper import PaperBroker
-from .models import Instrument, Side, Trade
+from .models import Instrument, Side, Signal, Trade
 from .risk import RiskConfig, RiskManager
-from .strategies import Ensemble, EnsembleConfig
+from .strategies import Ensemble, EnsembleConfig, Strategy
 
 
 @dataclass
@@ -62,18 +62,31 @@ class BacktestResult:
 
 def run_backtest(inst: Instrument, df: pd.DataFrame, cash: float = 10_000.0,
                  risk_cfg: RiskConfig | None = None, ens_cfg: EnsembleConfig | None = None,
-                 window: int = 400) -> BacktestResult:
-    ens = Ensemble(config=ens_cfg)
+                 strategies: list[Strategy] | None = None,
+                 trade_from: pd.Timestamp | None = None,
+                 context: dict[str, tuple[pd.Series, float]] | None = None) -> BacktestResult:
+    """``trade_from``: earlier bars only warm up the indicators (for out-of-sample tests).
+    ``context``: extra signals with history, {source: (score series indexed by the time
+    each value became known, confidence)} - e.g. weekly COT positioning. Each bar only
+    sees values published before its close.
+    """
+    ens = Ensemble(strategies, ens_cfg)
     risk = RiskManager(risk_cfg)
     broker = PaperBroker(cash)
     atr_all = ind.atr(df)
+    # Each bar's score only uses data up to that bar, so precomputing it is lookahead-free.
+    technical = ens.technical_frame(df)["technical"]
+    bar_len = pd.Series(df.index).diff().median()
+    known = {src: (ser.sort_index().asof(df.index + bar_len).to_numpy(), conf)
+             for src, (ser, conf) in (context or {}).items()}
     trades: list[Trade] = []
     curve = {}
     pending: Side | str | None = None   # action decided on the previous close
     last_exit = -10**9                  # bar index of the last exit, for the re-entry cooldown
     cooldown = risk.cfg.cooldown_bars
 
-    for i in range(ens.min_bars, len(df)):
+    first = ens.min_bars if trade_from is None else max(ens.min_bars, int(df.index.searchsorted(trade_from)))
+    for i in range(first, len(df)):
         bar = df.iloc[i]
         ts = df.index[i]
         o, h, l, c = bar["open"], bar["high"], bar["low"], bar["close"]
@@ -105,11 +118,13 @@ def run_backtest(inst: Instrument, df: pd.DataFrame, cash: float = 10_000.0,
         risk.on_equity(eq, ts.to_pydatetime())
         curve[ts] = eq
 
-        d = ens.decide(inst.name, df.iloc[max(0, i - window + 1): i + 1], (), pos.side.sign if pos else 0)
-        if d.action == "close":
+        signals = [Signal("technical", float(technical.iloc[i]))]
+        signals += [Signal(src, vals[i], conf) for src, (vals, conf) in known.items() if not np.isnan(vals[i])]
+        action = ens.action(ens.blend(signals), pos.side.sign if pos else 0)
+        if action == "close":
             pending = "close"
-        elif d.action in ("buy", "sell"):
-            pending = Side(d.action)
+        elif action in ("buy", "sell"):
+            pending = Side(action)
 
     last = df["close"].iloc[-1]
     if broker.positions():

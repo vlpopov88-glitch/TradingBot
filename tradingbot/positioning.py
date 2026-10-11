@@ -1,12 +1,15 @@
 """Watching other traders: what are big speculators and the crowd doing?
 
-* Gold / forex -> CFTC Commitments of Traders (weekly). We take large speculators'
-  net position as a % of open interest, rank it against the last ~3 years (the
-  "COT index"), and combine *momentum* (specs adding in the direction of the move)
-  with *contrarian fade at extremes* (crowded trades tend to reverse).
-* Crypto -> OKX derivatives data (hourly): top traders' long/short ratio (follow
-  the "smart money"), all-accounts long/short ratio (fade the retail crowd) and
-  funding rate (extreme funding = over-leveraged side, fade it).
+* Gold / forex -> CFTC Commitments of Traders (weekly). Large speculators' net
+  position as a % of open interest, ranked against the last ~3 years (the "COT
+  index"). The bot trades *against* their recent flow and against crowded extremes.
+  Research (`tradingbot research --what cot`, 10 years, gold + 3 FX pairs) found that
+  *following* speculators' 4-week flow had a negative edge (IC -0.07 at 1 week,
+  t=-3.1, same sign in both halves of the sample): they tend to pile in late.
+* Crypto -> OKX derivatives data: top traders' long/short ratio, all-accounts ratio
+  and funding rate. Only ~100 days of history exist, and over that window the
+  "follow top traders / fade the crowd" signal pointed the wrong way, so it is OFF
+  by default (`positioning.crypto` in config.yaml) until live data says otherwise.
 """
 from __future__ import annotations
 
@@ -40,16 +43,17 @@ def cot_score(rows: list[dict], invert: bool = False) -> Signal:
     if len(nets) < 10:
         return Signal("positioning", 0.0, 0.0, "not enough COT history")
     idx = cot_index(nets)
-    momentum = math.tanh((nets[0] - nets[min(4, len(nets) - 1)]) * 10)  # ~1 month change
-    # Extremes (>90th or <10th pct) are crowded -> contrarian; the middle -> follow flows.
-    if idx > 0.9:
-        score, why = -(idx - 0.9) * 10 * 0.6, "specs extremely long (crowded)"
+    flow = nets[0] - nets[min(4, len(nets) - 1)]            # ~1 month change in net positioning
+    score = -0.6 * math.tanh(flow * 10)                     # fade the speculators' recent flow
+    why = "fading speculator flow"
+    if idx > 0.9:                                           # crowded extremes: fade harder
+        score -= (idx - 0.9) * 10 * 0.4
+        why = "specs extremely long (crowded) - fading"
     elif idx < 0.1:
-        score, why = (0.1 - idx) * 10 * 0.6, "specs extremely short (crowded)"
-    else:
-        score, why = 0.6 * momentum, "following speculator flows"
+        score += (0.1 - idx) * 10 * 0.4
+        why = "specs extremely short (crowded) - fading"
     return Signal("positioning", score, 0.6,
-                  f"COT index {idx:.0%}, net {nets[0]:+.1%} of OI, 4wk chg {nets[0] - nets[min(4, len(nets) - 1)]:+.1%}; {why}")
+                  f"COT index {idx:.0%}, net {nets[0]:+.1%} of OI, 4wk chg {flow:+.1%}; {why}")
 
 
 def crypto_score(top_ratio: list[float], crowd_ratio: list[float], funding: float) -> Signal:
@@ -75,8 +79,10 @@ def crypto_score(top_ratio: list[float], crowd_ratio: list[float], funding: floa
 
 
 class PositioningAnalyzer:
-    def __init__(self, cot_weeks: int = 156, cot_refresh_s: int = 6 * 3600, crypto_refresh_s: int = 900):
+    def __init__(self, cot_weeks: int = 156, cot_refresh_s: int = 6 * 3600, crypto_refresh_s: int = 900,
+                 crypto: bool = False):
         self.cot_weeks = cot_weeks
+        self.crypto = crypto
         self._ttl = {"cot": cot_refresh_s, "crypto": crypto_refresh_s}
         self._cache: dict[str, tuple[float, Signal]] = {}
 
@@ -95,7 +101,9 @@ class PositioningAnalyzer:
         return sig
 
     def signal(self, inst: Instrument) -> Signal:
-        if inst.asset_class is AssetClass.CRYPTO and inst.okx_swap:
+        if inst.asset_class is AssetClass.CRYPTO:
+            if not (self.crypto and inst.okx_swap):
+                return Signal("positioning", 0.0, 0.0, "crypto positioning disabled")
             return self._cached(inst.name, "crypto", lambda: self._crypto(inst.okx_swap))
         if inst.cot_code:
             # COT futures are quoted vs USD (EUR, GBP, JPY...). For USD/XXX pairs invert.

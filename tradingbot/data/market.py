@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 import zlib
 from abc import ABC, abstractmethod
 
@@ -30,22 +31,24 @@ class MarketData(ABC):
 
 
 class YahooData(MarketData):
-    """Yahoo Finance chart API. Good for gold (GC=F) and forex (EURUSD=X)."""
+    """Yahoo Finance chart API. Good for gold (GC=F), forex (EURUSD=X) and long crypto history."""
 
     URL = "https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
-    _RANGES = {"5m": "30d", "15m": "30d", "30m": "30d", "1h": "180d", "4h": "720d", "1d": "5y"}
+    _BARS_PER_DAY = {"5m": 288, "15m": 96, "30m": 48, "1h": 24, "4h": 6, "1d": 1}
+    _MAX_DAYS = {"5m": 59, "15m": 59, "30m": 59, "1h": 729, "4h": 729, "1d": 36500}   # Yahoo's limits
 
     def candles(self, symbol, timeframe="1h", limit=300):
         interval = "1h" if timeframe == "4h" else timeframe
-        data = get_json(
-            self.URL.format(symbol=symbol),
-            params={"interval": interval, "range": self._RANGES.get(timeframe, "180d")},
-        )
+        # 1.6x calendar days covers weekends/holidays for markets that don't trade 24/7.
+        days = min(self._MAX_DAYS[timeframe], limit / self._BARS_PER_DAY[timeframe] * 1.6 + 4)
+        now = int(time.time())
+        data = get_json(self.URL.format(symbol=symbol),
+                        params={"interval": interval, "period1": now - int(days * 86400), "period2": now})
         res = data["chart"]["result"][0]
         q = res["indicators"]["quote"][0]
         rows = zip(res["timestamp"], q["open"], q["high"], q["low"], q["close"], q["volume"])
         rows = [[t, o, h, lo, c, v or 0] for t, o, h, lo, c, v in rows]
-        df = self._frame(rows, unit="s")
+        df = merge_live_tick(self._frame(rows, unit="s"), pd.Timedelta(_TF[interval]))
         if timeframe == "4h":
             df = resample(df, "4h")
         return df.tail(limit)
@@ -120,6 +123,23 @@ class SyntheticData(MarketData):
              "volume": rng.uniform(100, 1000, limit)},
             index=idx,
         )
+
+
+_TF = {"5m": "5min", "15m": "15min", "30m": "30min", "1h": "1h", "1d": "1D"}
+
+
+def merge_live_tick(df: pd.DataFrame, bar: pd.Timedelta) -> pd.DataFrame:
+    """Yahoo appends the latest trade as an extra row stamped mid-bar (e.g. 15:12:05
+    after the 15:00 bar). Fold it into the bar it belongs to so it is never mistaken
+    for a bar of its own (after the close it would otherwise look like a finished one)."""
+    if len(df) >= 2 and df.index[-1] - df.index[-2] < bar:
+        tick = df.iloc[-1]
+        df = df.iloc[:-1].copy()
+        last = df.index[-1]
+        df.loc[last, "close"] = tick["close"]
+        df.loc[last, "high"] = max(df.loc[last, "high"], tick["high"])
+        df.loc[last, "low"] = min(df.loc[last, "low"], tick["low"])
+    return df
 
 
 def resample(df: pd.DataFrame, rule: str) -> pd.DataFrame:

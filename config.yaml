@@ -4,7 +4,8 @@
 # mode: live   -> real orders via the brokers below; also needs --confirm-live
 # ---------------------------------------------------------------------------
 mode: paper
-timeframe: 1h          # bar size used for analysis: 5m 15m 30m 1h 4h 1d
+timeframe: 1d          # bar size for signals: 1h 4h 1d. Daily is the only one that held up
+                       # out of sample (see `tradingbot research`); stops/news still run every loop
 loop_seconds: 300      # how often the bot wakes up to re-analyze
 history_bars: 400
 starting_cash: 10000   # paper account size (USD)
@@ -30,7 +31,8 @@ risk:
   max_leverage: {crypto: 2.0, forex: 10.0, metal: 5.0}
 
 ensemble:
-  weights: {technical: 0.6, news: 0.25, positioning: 0.15}
+  strategies: [trend, momentum, breakout]   # also available: mean_reversion
+  weights: {technical: 0.5, positioning: 0.3, news: 0.2}
   entry_threshold: 0.35       # blended score needed to open (-1..+1)
   exit_threshold: 0.10        # close when the score flips past this against us
 
@@ -44,7 +46,8 @@ news:
   # feeds: [...]              # override the default RSS list
 
 positioning:
-  enabled: true               # CFTC COT for gold/FX, OKX trader data for crypto
+  enabled: true               # CFTC COT for gold/FX: fades speculators' recent flow
+  crypto: false               # OKX trader ratios/funding: unproven (only ~100 days of history)
 
 calendar:                     # no new entries around high-impact releases (NFP, CPI, FOMC...)
   enabled: true

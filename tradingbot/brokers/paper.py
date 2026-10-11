@@ -13,8 +13,9 @@ from .base import Broker
 
 log = logging.getLogger(__name__)
 
-# Half-spread + slippage per fill, in basis points of price.
-DEFAULT_COST_BPS = {"forex": 1.0, "metal": 2.0, "crypto": 5.0}
+# Spread/fee + slippage per fill, in basis points of price. Crypto is dominated by the
+# exchange taker fee (~0.1% at Binance/OKX/Bybit, more at Coinbase/Kraken).
+DEFAULT_COST_BPS = {"forex": 1.0, "metal": 2.0, "crypto": 10.0}
 
 
 class PaperBroker(Broker):

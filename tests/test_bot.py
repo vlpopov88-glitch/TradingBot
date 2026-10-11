@@ -95,9 +95,11 @@ def test_cot_crowded_long_is_contrarian():
     assert cot_score(_cot_rows(nets), invert=True).score > 0
 
 
-def test_cot_follow_flows_midrange():
+def test_cot_fades_speculator_flow_midrange():
+    # Specs added 20% of OI over 4 weeks: research says fade it (they pile in late).
     nets = [0.1, 0.05, 0.0, -0.05, -0.1] + list(np.linspace(0.5, -0.5, 40))
-    assert cot_score(_cot_rows(nets)).score > 0
+    assert cot_score(_cot_rows(nets)).score < 0
+    assert cot_score(_cot_rows(nets), invert=True).score > 0
 
 
 def test_crypto_positioning():
@@ -431,3 +433,66 @@ def test_engine_cooldown_and_snapshots(tmp_path):
     snaps = eng.journal.snapshots()
     assert {"technical", "news", "trend", "ensemble"} <= set(snaps["source"])
     assert snaps.groupby(["bar_ts", "source"]).size().max() == 1   # once per bar
+
+
+def test_crypto_positioning_off_by_default():
+    from tradingbot.positioning import PositioningAnalyzer
+    sig = PositioningAnalyzer().signal(Instrument("BTC/USD", AssetClass.CRYPTO, "okx", "BTC-USDT", "BTC/USDT",
+                                                  okx_swap="BTC-USDT-SWAP"))
+    assert sig.confidence == 0 and "disabled" in sig.reason
+
+
+def test_merge_live_tick():
+    from tradingbot.data.market import merge_live_tick
+    idx = pd.DatetimeIndex(["2026-10-11 14:00", "2026-10-11 15:00", "2026-10-11 15:12:05"], tz="UTC")
+    df = pd.DataFrame({"open": [1, 2, 2.5], "high": [1, 2.2, 3.0], "low": [1, 1.9, 2.4],
+                       "close": [1, 2.1, 2.6], "volume": 0.0}, index=idx)
+    out = merge_live_tick(df, pd.Timedelta("1h"))
+    assert list(out.index) == list(idx[:2])
+    assert out["close"].iloc[-1] == 2.6 and out["high"].iloc[-1] == 3.0 and out["low"].iloc[-1] == 1.9
+    aligned = df.iloc[:2]
+    assert merge_live_tick(aligned, pd.Timedelta("1h")).equals(aligned)
+
+
+def test_strategy_selection():
+    from tradingbot.strategies import EnsembleConfig, build_strategies
+    assert [s.name for s in Ensemble().strategies] == ["trend", "momentum", "breakout"]
+    assert [s.name for s in Ensemble(config=EnsembleConfig(strategies=["mean_reversion"])).strategies] == \
+        ["mean_reversion"]
+    with pytest.raises(ValueError):
+        build_strategies(["astrology"])
+
+
+def test_backtest_context_uses_only_published_values():
+    df = trend_df(600, slope=0.002)                       # strong uptrend -> technical says buy
+    base = run_backtest(XAU, df)
+    assert any(t.side is Side.BUY for t in base.trades)
+    # A strongly bearish context known from the start overrides the buys...
+    bearish = pd.Series(-1.0, index=[df.index[0] - pd.Timedelta(days=1)])
+    blocked = run_backtest(XAU, df, context={"positioning": (bearish, 1.0)})
+    assert not any(t.side is Side.BUY for t in blocked.trades)
+    # ...but a value published after the last bar must never be seen.
+    future = pd.Series(-1.0, index=[df.index[-1] + pd.Timedelta(days=30)])
+    later = run_backtest(XAU, df, context={"positioning": (future, 1.0)})
+    assert len(later.trades) == len(base.trades)
+
+
+def test_evaluate_journal_separates_signal_from_noise(tmp_path, monkeypatch):
+    from tradingbot import research
+    df = SyntheticData().candles("XAU", "1h", 600)
+    monkeypatch.setattr(research, "get_provider", lambda name: SimpleNamespace(candles=lambda *a, **k: df))
+    j = Journal(str(tmp_path / "j.db"))
+    rng = np.random.default_rng(0)
+    rows = []
+    for i in range(300, 560):
+        decided = df.index[i] + pd.Timedelta(hours=1)                  # at the bar's close
+        fwd = df["close"].iloc[i + 4] / df["close"].iloc[i] - 1         # what happens next 4h
+        for source, score in (("oracle", np.sign(fwd) * 0.5), ("noise", rng.normal())):
+            rows.append((str(df.index[i]), "XAU/USD", decided.isoformat(), float(df["close"].iloc[i]),
+                         source, float(score), 1.0))
+    j.db.executemany("INSERT INTO snapshots VALUES (?,?,?,?,?,?,?)", rows)
+    cfg = Config(timeframe="1h", instruments=[XAU])
+    _, pooled = research.evaluate_journal(j.snapshots(), cfg)
+    by = {(s.source, s.horizon): s for s in pooled}
+    assert by[("oracle", "4h")].ic > 0.5 and research.verdict(by[("oracle", "4h")]) == "PREDICTIVE"
+    assert abs(by[("noise", "4h")].ic) < 0.2

@@ -24,6 +24,8 @@ from .strategies import Ensemble
 log = logging.getLogger(__name__)
 
 TF = {"1m": "1min", "5m": "5min", "15m": "15min", "30m": "30min", "1h": "1h", "4h": "4h", "1d": "1D"}
+INTRADAY = {"1m", "5m", "15m", "30m", "1h"}
+STALE_AFTER = pd.Timedelta(hours=3)   # no new price for this long = market closed or feed dead
 
 
 def closed_bars(df: pd.DataFrame, timeframe: str, now: datetime | None = None) -> pd.DataFrame:
@@ -80,12 +82,13 @@ class TradingEngine:
         self.risk = RiskManager(cfg.risk, state_file=os.path.join(cfg.state_dir, "risk_state.json"))
         self.news = news if news is not None else make_news(cfg)
         self.positioning = positioning if positioning is not None else (
-            PositioningAnalyzer() if cfg.positioning_enabled else None)
+            PositioningAnalyzer(crypto=cfg.positioning_crypto) if cfg.positioning_enabled else None)
         self.calendar = calendar if calendar is not None else (
             EconomicCalendar(cfg.calendar_minutes_before, cfg.calendar_minutes_after, cfg.calendar_impacts)
             if cfg.calendar_enabled else None)
         self.prices: dict[str, float] = {}
         self.last_exit: dict[str, pd.Timestamp] = {}
+        self.stale: dict[str, bool] = {}
         self._running = True
         self.kill_file = os.path.join(cfg.state_dir, "STOP")
 
@@ -98,16 +101,21 @@ class TradingEngine:
             out.append(self.positioning.signal(inst))
         return out
 
-    def analyze(self, inst: Instrument) -> tuple[Decision, pd.DataFrame] | None:
-        """Return (decision, closed bars), or None when there is nothing safe to act on."""
-        df = get_provider(inst.data_source).candles(inst.data_symbol, self.cfg.timeframe, self.cfg.history_bars)
+    def analyze(self, inst: Instrument, allow_stale: bool = False) -> tuple[Decision, pd.DataFrame] | None:
+        """Return (decision, closed bars), or None when there is nothing safe to act on.
+        ``allow_stale`` still analyzes a closed market (for display, never for trading)."""
+        provider = get_provider(inst.data_source)
+        df = provider.candles(inst.data_symbol, self.cfg.timeframe, self.cfg.history_bars)
         if df.empty:
             return None
-        self.prices[inst.name] = float(df["close"].iloc[-1])
-        age = pd.Timestamp.now(tz="UTC") - df.index[-1]
-        if age > 3 * pd.Timedelta(TF[self.cfg.timeframe]):
+        # Daily/4h bars can't tell whether the market is open right now; hourly bars can.
+        live = df if self.cfg.timeframe in INTRADAY else provider.candles(inst.data_symbol, "1h", 3)
+        self.prices[inst.name] = float(live["close"].iloc[-1])
+        age = pd.Timestamp.now(tz="UTC") - live.index[-1]
+        self.stale[inst.name] = age > STALE_AFTER
+        if age > STALE_AFTER and not allow_stale:
             # Weekend / holiday / dead feed: never trade on stale prices.
-            log.info("%s: last bar is %s old - market closed or data stale, skipping", inst.name, age)
+            log.info("%s: no price for %s - market closed or data stale, skipping", inst.name, age)
             return None
         bars = closed_bars(df, self.cfg.timeframe)
         if len(bars) < self.ensemble.min_bars:

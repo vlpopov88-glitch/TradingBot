@@ -14,7 +14,7 @@ from .strategies import EnsembleConfig
 @dataclass
 class Config:
     mode: str = "paper"                       # paper | live
-    timeframe: str = "1h"
+    timeframe: str = "1d"
     loop_seconds: int = 300
     history_bars: int = 400
     starting_cash: float = 10_000.0
@@ -29,6 +29,7 @@ class Config:
     news_llm_model: str = "claude-opus-5-5"
     news_llm_effort: str = "low"
     positioning_enabled: bool = True
+    positioning_crypto: bool = False          # OKX trader data: off until validated live
     calendar_enabled: bool = True
     calendar_minutes_before: int = 30
     calendar_minutes_after: int = 30
@@ -70,6 +71,7 @@ def load_config(path: str | Path = "config.yaml") -> Config:
     cfg.news_llm_model = llm.get("model", cfg.news_llm_model)
     cfg.news_llm_effort = llm.get("effort", cfg.news_llm_effort)
     cfg.positioning_enabled = raw.get("positioning", {}).get("enabled", True)
+    cfg.positioning_crypto = raw.get("positioning", {}).get("crypto", False)
     cal = raw.get("calendar", {})
     cfg.calendar_enabled = cal.get("enabled", True)
     cfg.calendar_minutes_before = cal.get("minutes_before", 30)

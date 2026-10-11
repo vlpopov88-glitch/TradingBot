@@ -27,11 +27,13 @@ TF = {"1m": "1min", "5m": "5min", "15m": "15min", "30m": "30min", "1h": "1h", "4
 
 
 def closed_bars(df: pd.DataFrame, timeframe: str, now: datetime | None = None) -> pd.DataFrame:
-    """Drop the still-forming last bar so signals don't repaint."""
+    """Keep only bars that have fully closed, so signals don't repaint.
+
+    Some feeds (Yahoo) append a live tick after the forming bar, so more than one
+    trailing row can be unfinished: a bar is closed once start + timeframe <= now.
+    """
     now = pd.Timestamp(now or datetime.now(timezone.utc))
-    if len(df) and df.index[-1] + pd.Timedelta(TF[timeframe]) > now:
-        return df.iloc[:-1]
-    return df
+    return df[df.index <= now - pd.Timedelta(TF[timeframe])]
 
 
 def make_news(cfg: Config) -> NewsAnalyzer | None:
@@ -75,7 +77,7 @@ class TradingEngine:
         self.broker = broker or make_broker(cfg)
         self.journal = journal or Journal(os.path.join(cfg.state_dir, "journal.db"))
         self.ensemble = Ensemble(config=cfg.ensemble)
-        self.risk = RiskManager(cfg.risk)
+        self.risk = RiskManager(cfg.risk, state_file=os.path.join(cfg.state_dir, "risk_state.json"))
         self.news = news if news is not None else make_news(cfg)
         self.positioning = positioning if positioning is not None else (
             PositioningAnalyzer() if cfg.positioning_enabled else None)
@@ -83,6 +85,7 @@ class TradingEngine:
             EconomicCalendar(cfg.calendar_minutes_before, cfg.calendar_minutes_after, cfg.calendar_impacts)
             if cfg.calendar_enabled else None)
         self.prices: dict[str, float] = {}
+        self.last_exit: dict[str, pd.Timestamp] = {}
         self._running = True
         self.kill_file = os.path.join(cfg.state_dir, "STOP")
 
@@ -96,6 +99,7 @@ class TradingEngine:
         return out
 
     def analyze(self, inst: Instrument) -> tuple[Decision, pd.DataFrame] | None:
+        """Return (decision, closed bars), or None when there is nothing safe to act on."""
         df = get_provider(inst.data_source).candles(inst.data_symbol, self.cfg.timeframe, self.cfg.history_bars)
         if df.empty:
             return None
@@ -111,7 +115,7 @@ class TradingEngine:
             return None
         pos = self.broker.positions().get(inst.name)
         side = pos.side.sign if pos else 0
-        return self.ensemble.decide(inst.name, bars, self.context_signals(inst), side), df
+        return self.ensemble.decide(inst.name, bars, self.context_signals(inst), side), bars
 
     # ---- one cycle --------------------------------------------------------
     def step(self) -> None:
@@ -122,6 +126,7 @@ class TradingEngine:
         for t in self.broker.sync(self.instruments):
             log.info("broker closed %s: pnl %.2f (%s)", t.instrument, t.pnl_usd, t.reason)
             self.journal.trade(t)
+            self.last_exit[t.instrument] = pd.Timestamp.now(tz="UTC")
 
         for inst in self.instruments.values():
             try:
@@ -141,25 +146,17 @@ class TradingEngine:
         res = self.analyze(inst)
         if res is None:
             return
-        decision, df = res
+        decision, bars = res
         price = self.prices[inst.name]
+        self.journal.snapshot(inst.name, bars.index[-1], price, decision)
         if isinstance(self.broker, PaperBroker):
             self.broker.mark(inst, price)
-        atr = float(ind.atr(df).iloc[-1])
+        atr = float(ind.atr(bars).iloc[-1])
         pos = self.broker.positions().get(inst.name)
 
-        # 1. Manage the open position: trailing stop, stop/target hit, signal exit.
+        # 1. Manage the open position: stops/targets bar by bar, then the signal exit.
         if pos:
-            since = df[df.index > pd.Timestamp(pos.opened_at)]
-            hi = max([price, *since["high"].tolist()])
-            lo = min([price, *since["low"].tolist()])
-            old_sl = pos.stop_loss
-            self.risk.update_trailing(pos, hi, lo, atr)
-            if pos.stop_loss != old_sl:
-                self.broker.update_stop(inst, pos)
-            hit = self.risk.stop_hit(pos, hi, lo)
-            if hit:
-                self._close(inst, hit[0], hit[1])
+            if self._manage_position(inst, pos, bars, price, atr):
                 return
             if decision.action == "close":
                 self._close(inst, price, f"signal flip ({decision.score:+.2f})")
@@ -169,6 +166,11 @@ class TradingEngine:
         if decision.action in ("buy", "sell"):
             self.journal.decision(decision)
             side = Side(decision.action)
+            exited = self.last_exit.get(inst.name)
+            wait = self.cfg.risk.cooldown_bars * pd.Timedelta(TF[self.cfg.timeframe])
+            if exited is not None and pd.Timestamp.now(tz="UTC") - exited < wait:
+                log.info("%s: %s signal %+.2f - cooling down after exit", inst.name, side.value, decision.score)
+                return
             if os.path.exists(self.kill_file):
                 log.warning("kill switch %s present: no new entries", self.kill_file)
                 return
@@ -196,11 +198,39 @@ class TradingEngine:
         else:
             log.debug("%s: hold (score %+.2f)", inst.name, decision.score)
 
+    def _manage_position(self, inst: Instrument, pos, bars: pd.DataFrame, price: float, atr: float) -> bool:
+        """Run stops over each newly closed bar in order, then over the live price.
+
+        Order matters: a trailing stop raised by a later high must never be compared
+        with an earlier low. Within a bar the stop is checked before trailing it.
+        Returns True if the position was closed.
+        """
+        tf = pd.Timedelta(TF[self.cfg.timeframe])
+        start = (pd.Timestamp(pos.checked_until) if pos.checked_until
+                 else pd.Timestamp(pos.opened_at).floor(tf))   # skip the entry bar's pre-entry range
+        for ts, bar in bars[bars.index > start].iterrows():
+            hit = self.risk.stop_hit(pos, bar["high"], bar["low"], bar["open"])
+            if hit:
+                self._close(inst, *hit)
+                return True
+            old_sl = pos.stop_loss
+            self.risk.update_trailing(pos, bar["high"], bar["low"], atr)
+            if pos.stop_loss != old_sl:
+                self.broker.update_stop(inst, pos)
+            pos.checked_until = ts.isoformat()
+        self.broker.save_state()
+        hit = self.risk.stop_hit(pos, price, price, price)   # fills at the live price
+        if hit:
+            self._close(inst, *hit)
+            return True
+        return False
+
     def _close(self, inst: Instrument, price: float, reason: str) -> None:
         t = self.broker.close(inst, price, reason)
         if t:
             log.info("CLOSE %s %s @ %.5g pnl %.2f USD (%s)", t.side.value, inst.name, t.exit_price, t.pnl_usd, reason)
             self.journal.trade(t)
+            self.last_exit[inst.name] = pd.Timestamp.now(tz="UTC")
 
     def flatten(self, reason: str = "manual flatten") -> None:
         for name in list(self.broker.positions()):

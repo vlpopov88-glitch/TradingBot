@@ -29,6 +29,9 @@ class Broker(ABC):
     def update_stop(self, inst: Instrument, pos: Position) -> None:
         """Push a moved (trailing) stop to the venue, if it holds stops server-side."""
 
+    def save_state(self) -> None:
+        """Persist locally tracked position state (stops, check progress), if any."""
+
     def sync(self, instruments: dict[str, Instrument]) -> list[Trade]:
         """Reconcile with the venue; return positions it closed on its own (e.g. hard stops)."""
         return []

@@ -9,6 +9,8 @@ import logging
 import os
 from datetime import datetime, timezone
 
+import pandas as pd
+
 from ..http import session, TIMEOUT
 from ..models import Instrument, Position, Side, Trade
 from .base import Broker
@@ -102,8 +104,9 @@ class OandaBroker(Broker):
             side = Side.BUY if units > 0 else Side.SELL
             sl = float(t.get("stopLossOrder", {}).get("price", 0)) or 0.0
             tp = float(t.get("takeProfitOrder", {}).get("price", 0)) or (float("inf") if side is Side.BUY else 0.0)
+            opened = pd.Timestamp(t["openTime"]).floor("s").to_pydatetime()
             self._positions[inst.name] = Position(inst.name, side, abs(units), float(t["price"]), sl, tp,
-                                                  broker_id=tid)
+                                                  opened_at=opened, broker_id=tid)
             log.info("adopted existing OANDA trade %s on %s", tid, inst.name)
         return closed
 

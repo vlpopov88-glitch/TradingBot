@@ -70,6 +70,8 @@ def run_backtest(inst: Instrument, df: pd.DataFrame, cash: float = 10_000.0,
     trades: list[Trade] = []
     curve = {}
     pending: Side | str | None = None   # action decided on the previous close
+    last_exit = -10**9                  # bar index of the last exit, for the re-entry cooldown
+    cooldown = risk.cfg.cooldown_bars
 
     for i in range(ens.min_bars, len(df)):
         bar = df.iloc[i]
@@ -80,8 +82,8 @@ def run_backtest(inst: Instrument, df: pd.DataFrame, cash: float = 10_000.0,
         # Execute last bar's decision at this bar's open.
         if pending == "close" and pos:
             trades.append(broker.close(inst, o, "signal flip", when=ts))
-            pos = None
-        elif isinstance(pending, Side) and not pos:
+            pos, last_exit = None, i
+        elif isinstance(pending, Side) and not pos and i - last_exit > cooldown:
             ok, _ = risk.can_open(inst, broker.positions(), {inst.name: inst})
             if ok:
                 qty, sl, tp = risk.plan(inst, pending, o, float(atr_all.iloc[i - 1]), broker.equity({inst.name: o}))
@@ -94,7 +96,7 @@ def run_backtest(inst: Instrument, df: pd.DataFrame, cash: float = 10_000.0,
             hit = risk.stop_hit(pos, h, l, o)
             if hit:
                 trades.append(broker.close(inst, hit[0], hit[1], when=ts))
-                pos = None
+                pos, last_exit = None, i
             else:
                 risk.update_trailing(pos, h, l, float(atr_all.iloc[i]))
 

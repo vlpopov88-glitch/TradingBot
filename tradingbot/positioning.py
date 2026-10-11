@@ -86,10 +86,12 @@ class PositioningAnalyzer:
             return hit[1]
         try:
             sig = fn()
+            stamp = time.time()
         except Exception as exc:
             log.warning("positioning fetch failed for %s: %s", key, exc)
             sig = hit[1] if hit else Signal("positioning", 0.0, 0.0, f"unavailable: {exc}")
-        self._cache[key] = (time.time(), sig)
+            stamp = time.time() - self._ttl[kind] + 600   # retry a failure after 10 minutes
+        self._cache[key] = (stamp, sig)
         return sig
 
     def signal(self, inst: Instrument) -> Signal:

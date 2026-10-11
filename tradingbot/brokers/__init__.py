@@ -38,6 +38,10 @@ class RoutingBroker(Broker):
     def update_stop(self, inst, pos):
         self._for(inst).update_stop(inst, pos)
 
+    def save_state(self):
+        for b in self._unique:
+            b.save_state()
+
     def sync(self, instruments):
         return [t for b in self._unique for t in b.sync(instruments)]
 

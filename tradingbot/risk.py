@@ -1,8 +1,10 @@
 """Risk management: position sizing, stops, exposure limits and circuit breakers."""
 from __future__ import annotations
 
+import json
 import logging
 import math
+import os
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 
@@ -20,7 +22,8 @@ class RiskConfig:
     max_open_positions: int = 4
     max_positions_per_class: int = 2
     max_daily_loss: float = 0.03          # halt new trades for the day past this
-    max_drawdown: float = 0.15            # halt everything (until restarted) past this
+    max_drawdown: float = 0.15            # halt new trades until `tradingbot resume` past this
+    cooldown_bars: int = 2                # bars to wait before re-entering a market after an exit
     max_leverage: dict[str, float] = field(default_factory=lambda: {
         "crypto": 2.0, "forex": 10.0, "metal": 5.0})
 
@@ -42,12 +45,39 @@ def round_qty(inst: Instrument, qty: float) -> float:
 
 
 class RiskManager:
-    def __init__(self, cfg: RiskConfig | None = None):
+    """Circuit-breaker state is persisted, so a restart can't silently lift a halt."""
+
+    def __init__(self, cfg: RiskConfig | None = None, state_file: str | None = None):
         self.cfg = cfg or RiskConfig()
+        self.state_file = state_file
         self.peak_equity = 0.0
         self.day: date | None = None
         self.day_start_equity = 0.0
         self.halted_reason: str | None = None
+        if state_file and os.path.exists(state_file):
+            with open(state_file) as f:
+                st = json.load(f)
+            self.peak_equity = st.get("peak_equity", 0.0)
+            self.day = date.fromisoformat(st["day"]) if st.get("day") else None
+            self.day_start_equity = st.get("day_start_equity", 0.0)
+            self.halted_reason = st.get("halted_reason")
+            if self.halted_reason:
+                log.warning("trading halted (restored): %s", self.halted_reason)
+
+    def _save(self) -> None:
+        if not self.state_file:
+            return
+        tmp = self.state_file + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump({"peak_equity": self.peak_equity, "day": self.day.isoformat() if self.day else None,
+                       "day_start_equity": self.day_start_equity, "halted_reason": self.halted_reason}, f)
+        os.replace(tmp, self.state_file)
+
+    def resume(self) -> None:
+        """Lift any halt and re-base the drawdown peak on the next equity reading."""
+        self.halted_reason = None
+        self.peak_equity = 0.0
+        self._save()
 
     # ---- circuit breakers -------------------------------------------------
     def on_equity(self, equity: float, now: datetime | None = None) -> None:
@@ -66,6 +96,7 @@ class RiskManager:
               and not self.halted_reason):
             log.warning("daily loss limit hit: %.2f -> %.2f", self.day_start_equity, equity)
             self.halted_reason = f"daily loss limit {self.cfg.max_daily_loss:.0%} hit"
+        self._save()
 
     # ---- entries ----------------------------------------------------------
     def can_open(self, inst: Instrument, positions: dict[str, Position],
@@ -76,7 +107,7 @@ class RiskManager:
             return False, "already in position"
         if len(positions) >= self.cfg.max_open_positions:
             return False, "max open positions"
-        same = sum(1 for n in positions if instruments[n].asset_class is inst.asset_class)
+        same = sum(1 for n in positions if n in instruments and instruments[n].asset_class is inst.asset_class)
         if same >= self.cfg.max_positions_per_class:
             return False, f"max {inst.asset_class.value} positions"
         return True, ""

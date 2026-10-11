@@ -90,6 +90,7 @@ class Position:
     broker_id: str | None = None
     highest: float = 0.0        # best price seen, for trailing stops
     lowest: float = 0.0
+    checked_until: str | None = None   # ISO start of the last closed bar run through stop checks
 
     def __post_init__(self) -> None:
         self.highest = self.highest or self.entry_price

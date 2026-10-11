@@ -14,6 +14,9 @@ CREATE TABLE IF NOT EXISTS trades (
 CREATE TABLE IF NOT EXISTS decisions (
     id INTEGER PRIMARY KEY, ts TEXT, instrument TEXT, score REAL, action TEXT, signals TEXT);
 CREATE TABLE IF NOT EXISTS equity (ts TEXT PRIMARY KEY, equity REAL, open_positions INTEGER);
+CREATE TABLE IF NOT EXISTS snapshots (
+    bar_ts TEXT, instrument TEXT, ts TEXT, price REAL, source TEXT, score REAL, confidence REAL,
+    PRIMARY KEY (bar_ts, instrument, source));
 """
 
 
@@ -37,6 +40,18 @@ class Journal:
                         (datetime.now(timezone.utc).isoformat(), d.instrument, d.score, d.action,
                          json.dumps(sigs)))
         self.db.commit()
+
+    def snapshot(self, instrument: str, bar_ts, price: float, d: Decision) -> None:
+        """Record every component's score once per closed bar, for `tradingbot evaluate`."""
+        now = datetime.now(timezone.utc).isoformat()
+        rows = [(str(bar_ts), instrument, now, price, s.source, s.score, s.confidence) for s in d.signals]
+        rows.append((str(bar_ts), instrument, now, price, "ensemble", d.score, 1.0))
+        self.db.executemany("INSERT OR IGNORE INTO snapshots VALUES (?,?,?,?,?,?,?)", rows)
+        self.db.commit()
+
+    def snapshots(self):
+        import pandas as pd
+        return pd.read_sql_query("SELECT * FROM snapshots", self.db)
 
     def equity(self, value: float, n_positions: int) -> None:
         self.db.execute("INSERT OR REPLACE INTO equity VALUES (?,?,?)",

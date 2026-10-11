@@ -358,3 +358,76 @@ def test_llm_overrides_lexicon():
     na.headlines = {title: Headline(title, datetime.now(timezone.utc), "t")}
     na.llm.score([title])
     assert na.signal(XAU).score > 0
+
+
+# ---- regressions ----------------------------------------------------------
+def _bars(rows, start="2026-01-05 10:00"):
+    idx = pd.date_range(start, periods=len(rows), freq="h", tz="UTC")
+    return pd.DataFrame(rows, columns=["open", "high", "low", "close"], index=idx).assign(volume=1.0)
+
+
+def test_trailing_stop_never_compared_with_earlier_low(tmp_path):
+    """A dip followed by a rally must not stop out at the raised trailing stop."""
+    cfg = Config(state_dir=str(tmp_path), instruments=[XAU], calendar_enabled=False)
+    eng = TradingEngine(cfg, broker=PaperBroker(10_000, cost_bps={"metal": 0}), news=_StubCtx(0), positioning=None)
+    eng.cfg.risk.trailing_atr_mult = 2.5
+    pos = eng.broker.open(XAU, Side.BUY, 1, 100, 95, 1_000, when=datetime(2026, 1, 5, 10, 30, tzinfo=timezone.utc))
+    bars = _bars([[100, 100.5, 99.5, 100],       # entry bar (pre-entry range ignored)
+                  [100, 101, 97, 100],           # dip, stop 95 untouched
+                  [100, 110, 105, 109],
+                  [109, 120, 116, 119]])
+    closed = eng._manage_position(XAU, pos, bars, price=119, atr=2.0)
+    assert not closed
+    assert pos.stop_loss == pytest.approx(115)          # trailed to highest 120 - 5
+    assert pos.checked_until == str(bars.index[-1].isoformat())
+    # Next cycle: only new bars are walked; a later bar through the stop closes it.
+    more = pd.concat([bars, _bars([[119, 119.5, 114, 114.5]], start="2026-01-05 14:00")])
+    assert eng._manage_position(XAU, pos, more, price=114.5, atr=2.0)
+    t = eng.journal.recent_trades(1)[0]
+    assert t[5] == pytest.approx(115) and t[7] == "stop_loss"
+
+
+def test_live_price_through_stop_fills_at_price(tmp_path):
+    cfg = Config(state_dir=str(tmp_path), instruments=[XAU], calendar_enabled=False)
+    eng = TradingEngine(cfg, broker=PaperBroker(10_000, cost_bps={"metal": 0}), news=_StubCtx(0), positioning=None)
+    pos = eng.broker.open(XAU, Side.SELL, 1, 100, 105, 90, when=datetime(2026, 1, 5, 10, 30, tzinfo=timezone.utc))
+    bars = _bars([[100, 100.5, 99.5, 100]])
+    assert eng._manage_position(XAU, pos, bars, price=107, atr=2.0)    # gapped above the stop
+    assert eng.journal.recent_trades(1)[0][5] == pytest.approx(107)
+
+
+def test_closed_bars_drops_yahoo_live_tick():
+    idx = pd.DatetimeIndex(["2026-10-11 14:00", "2026-10-11 15:00", "2026-10-11 15:12:05"], tz="UTC")
+    df = pd.DataFrame({"open": 1.0, "high": 1.0, "low": 1.0, "close": 1.0, "volume": 0.0}, index=idx)
+    out = closed_bars(df, "1h", pd.Timestamp("2026-10-11 15:12:30", tz="UTC"))
+    assert list(out.index) == [pd.Timestamp("2026-10-11 14:00", tz="UTC")]
+
+
+def test_risk_halt_survives_restart(tmp_path):
+    path = str(tmp_path / "risk.json")
+    t = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    rm = RiskManager(RiskConfig(max_drawdown=0.10), state_file=path)
+    rm.on_equity(10_000, t)
+    rm.on_equity(8_900, t + timedelta(days=1))
+    assert "drawdown" in rm.halted_reason
+    rm2 = RiskManager(RiskConfig(max_drawdown=0.10), state_file=path)
+    assert "drawdown" in rm2.halted_reason and rm2.peak_equity == 10_000
+    rm2.resume()
+    rm3 = RiskManager(RiskConfig(max_drawdown=0.10), state_file=path)
+    assert rm3.halted_reason is None
+    rm3.on_equity(8_900, t + timedelta(days=1))
+    assert rm3.halted_reason is None and rm3.peak_equity == 8_900   # peak re-based
+
+
+def test_engine_cooldown_and_snapshots(tmp_path):
+    cfg = Config(state_dir=str(tmp_path), instruments=[XAU], history_bars=400, calendar_enabled=False)
+    cfg.ensemble.entry_threshold = 0.0
+    eng = TradingEngine(cfg, broker=PaperBroker(10_000), news=_StubCtx(1.0), positioning=None)
+    eng.step()
+    assert "XAU/USD" in eng.broker.positions()
+    eng._close(XAU, eng.prices["XAU/USD"], "test")
+    eng.step()
+    assert "XAU/USD" not in eng.broker.positions()          # cooling down
+    snaps = eng.journal.snapshots()
+    assert {"technical", "news", "trend", "ensemble"} <= set(snaps["source"])
+    assert snaps.groupby(["bar_ts", "source"]).size().max() == 1   # once per bar

@@ -101,3 +101,6 @@ class PaperBroker(Broker):
 
     def update_stop(self, inst, pos):
         self._save()
+
+    def save_state(self):
+        self._save()

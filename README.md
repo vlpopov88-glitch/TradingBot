@@ -3,7 +3,9 @@
 An automated trading bot that continuously:
 
 1. **Runs technical strategies**: trend following (EMA 20/50/200), momentum (MACD + ROC), Donchian breakout, and mean reversion (RSI + Bollinger). It blends them according to the market regime detected by ADX: trend strategies get more weight in trending markets and mean reversion more in ranging ones.
-2. **Analyzes news**: it polls RSS feeds (Investing.com, Cointelegraph, MarketWatch, Google News), tags each headline with the assets and currencies it mentions, and scores it with a finance lexicon. That lexicon covers hawkish/dovish central-bank tone and safe-haven flows into gold. Older headlines count less (exponential decay). For a pair, the score is `sentiment(base) − sentiment(quote)`.
+2. **Analyzes news**: it polls RSS feeds (Investing.com, Cointelegraph, MarketWatch, Google News) and scores every headline per asset and currency. Older headlines count less (exponential decay). For a pair, the score is `sentiment(base) − sentiment(quote)`.
+   - **With `ANTHROPIC_API_KEY` set** (and `pip install anthropic`): Claude reads the headlines in batches and returns the expected direction for each affected asset, including second-order effects such as hot US CPI → stronger USD → weaker gold. Each headline is scored once and cached, so steady-state cost is only the few new headlines per refresh. The model and effort level are set in `config.yaml` under `news.llm`.
+   - **Without it, or if a call fails:** a keyword lexicon covering hawkish/dovish central-bank tone and safe-haven flows. It works, but misreads context (e.g. "Bitcoin stuck in range").
 3. **Watches other traders**:
    - **Gold & forex:** CFTC Commitments of Traders. The bot ranks large speculators' net position against the last 3 years. It follows their flows in the mid-range and fades them at crowded extremes.
    - **Crypto:** OKX top-trader long/short ratio (follow the "smart money"), all-accounts ratio (fade the retail crowd) and the funding rate (fade over-leveraged positioning).
@@ -12,6 +14,7 @@ An automated trading bot that continuously:
    - Leverage caps per asset class, plus limits on open positions in total and per class.
    - A daily-loss circuit breaker and a max-drawdown halt.
    - No trading on stale data (weekends and holidays).
+   - **Economic-calendar blackout:** no new entries 30 minutes before to 30 minutes after high-impact releases (NFP, CPI, FOMC, ...) for the affected currencies. Gold and crypto count as USD-exposed. Events come from the Forex Factory weekly feed.
    - A kill switch file.
 5. **Executes**: in paper mode by default. In live mode it routes gold and FX to **OANDA** and crypto to any **CCXT** exchange.
 
@@ -89,8 +92,6 @@ Real data, technical layer only (no news or positioning history), 1% risk per tr
 
 Conclusion: textbook indicators alone are not an edge. Don't tune parameters until these numbers turn green. That's overfitting, and it falls apart live. Better next steps:
 - Collect a few weeks of journal data. Measure whether the news and positioning signals actually predict returns, then adjust the weights.
-- Upgrade the news layer from keywords to an LLM classifier (the lexicon misreads headlines like "Bitcoin stuck in range").
-- Add an economic-calendar blackout around NFP, CPI and FOMC.
 - Walk-forward / out-of-sample testing for any change.
 
 ## Project layout
@@ -100,7 +101,9 @@ tradingbot/
   data/market.py   Yahoo, OKX, OANDA and synthetic candle providers
   indicators.py    EMA, RSI, ATR, ADX, MACD, Bollinger, Donchian
   strategies.py    4 strategies + regime-aware ensemble
-  news.py          RSS ingestion + sentiment scoring
+  news.py          RSS ingestion + keyword sentiment
+  llm_news.py      Claude headline scoring (optional)
+  econ_calendar.py high-impact event blackout
   positioning.py   CFTC COT + OKX crypto trader positioning
   risk.py          sizing, stops, trailing, limits, circuit breakers
   brokers/         paper, OANDA, CCXT, router

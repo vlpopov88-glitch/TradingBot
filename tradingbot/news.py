@@ -156,8 +156,9 @@ def score_headline(title: str) -> dict[str, float]:
 
 class NewsAnalyzer:
     def __init__(self, feeds: list[str] | None = None, half_life_hours: float = 6.0,
-                 refresh_seconds: int = 300, max_age_hours: float = 48.0) -> None:
+                 refresh_seconds: int = 300, max_age_hours: float = 48.0, llm=None) -> None:
         self.feeds = feeds or DEFAULT_FEEDS
+        self.llm = llm   # optional LLMNewsScorer; the lexicon covers anything it hasn't scored
         self.half_life = half_life_hours
         self.refresh = refresh_seconds
         self.max_age = max_age_hours
@@ -181,8 +182,16 @@ class NewsAnalyzer:
                 log.warning("news feed failed %s: %s", url, exc)
         cutoff = datetime.now(timezone.utc).timestamp() - self.max_age * 3600
         self.headlines = {k: h for k, h in self.headlines.items() if h.published.timestamp() >= cutoff}
-        log.info("news: %d new headlines, %d tracked", new, len(self.headlines))
+        if self.llm:
+            self.llm.score(list(self.headlines))
+        log.info("news: %d new headlines, %d tracked%s", new, len(self.headlines),
+                 f", {sum(t in self.llm.cache for t in self.headlines)} scored by LLM" if self.llm else "")
         return new
+
+    def score(self, title: str) -> dict[str, float]:
+        if self.llm and title in self.llm.cache:
+            return self.llm.cache[title]
+        return score_headline(title)
 
     def _entity_scores(self, now: datetime) -> tuple[dict[str, float], dict[str, float], dict[str, list[str]]]:
         total: dict[str, float] = {}
@@ -191,7 +200,7 @@ class NewsAnalyzer:
         for h in self.headlines.values():
             age_h = max(0.0, (now - h.published).total_seconds() / 3600)
             decay = 0.5 ** (age_h / self.half_life)
-            for e, s in score_headline(h.title).items():
+            for e, s in self.score(h.title).items():
                 total[e] = total.get(e, 0.0) + s * decay
                 weight[e] = weight.get(e, 0.0) + decay
                 if abs(s) > 0.3:

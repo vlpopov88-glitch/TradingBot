@@ -5,6 +5,7 @@ import argparse
 import logging
 import os
 import sys
+from datetime import timezone
 
 from .config import load_config
 
@@ -33,6 +34,8 @@ def cmd_analyze(cfg, args):
     eng = TradingEngine(cfg, broker=PaperBroker(cfg.starting_cash))
     if eng.news:
         eng.news.update(force=True)
+    if eng.calendar:
+        eng.calendar.update(force=True)
     for inst in eng.instruments.values():
         try:
             res = eng.analyze(inst)
@@ -46,15 +49,21 @@ def cmd_analyze(cfg, args):
         print(f"\n{inst.name} @ {eng.prices[inst.name]:.5g}  ->  {d.action.upper()}  (score {d.score:+.2f})")
         for s in d.signals:
             print(f"   {s.source:<15} {s.score:+.2f}  conf {s.confidence:.2f}  {s.reason}")
+        if eng.calendar:
+            for e in eng.calendar.upcoming(inst)[:3]:
+                print(f"   ! {e.time.astimezone(timezone.utc):%a %H:%M} UTC  {e.currency} {e.title} (no new entries "
+                      f"{cfg.calendar_minutes_before}m before to {cfg.calendar_minutes_after}m after)")
 
 
 def cmd_news(cfg, args):
-    from .news import NewsAnalyzer, score_headline
-    na = NewsAnalyzer(cfg.news_feeds, cfg.news_half_life_hours)
+    from .engine import make_news
+    na = make_news(cfg)
+    if na is None:
+        sys.exit("news is disabled in config")
     na.update(force=True)
     rows = sorted(na.headlines.values(), key=lambda h: h.published, reverse=True)
     for h in rows[: args.limit]:
-        scores = score_headline(h.title)
+        scores = na.score(h.title)
         if scores or args.all:
             tag = " ".join(f"{k}{v:+.2f}" for k, v in scores.items())
             print(f"{h.published:%m-%d %H:%M}  {tag:<28} {h.title[:110]}")

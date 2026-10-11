@@ -13,6 +13,7 @@ from . import indicators as ind
 from .brokers import Broker, PaperBroker, RoutingBroker, build_broker
 from .config import Config
 from .data import get_provider
+from .econ_calendar import EconomicCalendar
 from .journal import Journal
 from .models import Decision, Instrument, Side, Signal
 from .news import NewsAnalyzer
@@ -33,6 +34,23 @@ def closed_bars(df: pd.DataFrame, timeframe: str, now: datetime | None = None) -
     return df
 
 
+def make_news(cfg: Config) -> NewsAnalyzer | None:
+    if not cfg.news_enabled:
+        return None
+    llm = None
+    if cfg.news_llm_enabled:
+        from .llm_news import LLMNewsScorer, credentials_available
+        if not credentials_available():
+            log.info("news: no ANTHROPIC_API_KEY - using keyword sentiment")
+        else:
+            try:
+                llm = LLMNewsScorer(cfg.news_llm_model, cfg.news_llm_effort)
+                log.info("news: scoring headlines with %s", cfg.news_llm_model)
+            except Exception as exc:
+                log.warning("news: LLM scorer unavailable (%s) - using keyword sentiment", exc)
+    return NewsAnalyzer(cfg.news_feeds, cfg.news_half_life_hours, llm=llm)
+
+
 def make_broker(cfg: Config) -> Broker:
     if cfg.mode == "paper":
         os.makedirs(cfg.state_dir, exist_ok=True)
@@ -49,7 +67,8 @@ def make_broker(cfg: Config) -> Broker:
 
 class TradingEngine:
     def __init__(self, cfg: Config, broker: Broker | None = None, journal: Journal | None = None,
-                 news: NewsAnalyzer | None = None, positioning: PositioningAnalyzer | None = None):
+                 news: NewsAnalyzer | None = None, positioning: PositioningAnalyzer | None = None,
+                 calendar: EconomicCalendar | None = None):
         self.cfg = cfg
         self.instruments = cfg.by_name
         os.makedirs(cfg.state_dir, exist_ok=True)
@@ -57,10 +76,12 @@ class TradingEngine:
         self.journal = journal or Journal(os.path.join(cfg.state_dir, "journal.db"))
         self.ensemble = Ensemble(config=cfg.ensemble)
         self.risk = RiskManager(cfg.risk)
-        self.news = news if news is not None else (
-            NewsAnalyzer(cfg.news_feeds, cfg.news_half_life_hours) if cfg.news_enabled else None)
+        self.news = news if news is not None else make_news(cfg)
         self.positioning = positioning if positioning is not None else (
             PositioningAnalyzer() if cfg.positioning_enabled else None)
+        self.calendar = calendar if calendar is not None else (
+            EconomicCalendar(cfg.calendar_minutes_before, cfg.calendar_minutes_after, cfg.calendar_impacts)
+            if cfg.calendar_enabled else None)
         self.prices: dict[str, float] = {}
         self._running = True
         self.kill_file = os.path.join(cfg.state_dir, "STOP")
@@ -96,6 +117,8 @@ class TradingEngine:
     def step(self) -> None:
         if self.news:
             self.news.update()
+        if self.calendar:
+            self.calendar.update()
         for t in self.broker.sync(self.instruments):
             log.info("broker closed %s: pnl %.2f (%s)", t.instrument, t.pnl_usd, t.reason)
             self.journal.trade(t)
@@ -150,6 +173,11 @@ class TradingEngine:
                 log.warning("kill switch %s present: no new entries", self.kill_file)
                 return
             if side is Side.SELL and not self.broker.can_short(inst):
+                return
+            event = self.calendar.blackout(inst) if self.calendar else None
+            if event:
+                log.info("%s: %s signal %+.2f held back - %s %s at %s UTC", inst.name, side.value,
+                         decision.score, event.currency, event.title, f"{event.time.astimezone(timezone.utc):%H:%M}")
                 return
             ok, why = self.risk.can_open(inst, self.broker.positions(), self.instruments)
             if not ok:

@@ -37,10 +37,20 @@ ensemble:
 news:
   enabled: true
   half_life_hours: 6          # older headlines count less
+  llm:                        # read headlines with Claude (falls back to keywords)
+    enabled: true             # active only when ANTHROPIC_API_KEY is set and `anthropic` installed
+    model: claude-opus-5-5
+    effort: low
   # feeds: [...]              # override the default RSS list
 
 positioning:
   enabled: true               # CFTC COT for gold/FX, OKX trader data for crypto
+
+calendar:                     # no new entries around high-impact releases (NFP, CPI, FOMC...)
+  enabled: true
+  minutes_before: 30
+  minutes_after: 30
+  impacts: [High]
 
 instruments:
   - name: XAU/USD

@@ -1,4 +1,6 @@
+import json
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 
 import numpy as np
 import pandas as pd
@@ -9,8 +11,10 @@ from tradingbot.backtest import run_backtest
 from tradingbot.brokers.paper import PaperBroker
 from tradingbot.config import Config, load_config
 from tradingbot.data.market import SyntheticData
+from tradingbot.econ_calendar import EconomicCalendar, parse_events
 from tradingbot.engine import TradingEngine, closed_bars
 from tradingbot.journal import Journal
+from tradingbot.llm_news import LLMNewsScorer
 from tradingbot.models import AssetClass, Instrument, Position, Side, Signal
 from tradingbot.news import NewsAnalyzer, Headline, parse_feed, score_headline
 from tradingbot.positioning import cot_score, crypto_score
@@ -223,7 +227,7 @@ class _StubCtx:
 
 
 def test_engine_cycle(tmp_path):
-    cfg = Config(state_dir=str(tmp_path), instruments=[XAU, BTC], history_bars=400)
+    cfg = Config(state_dir=str(tmp_path), instruments=[XAU, BTC], history_bars=400, calendar_enabled=False)
     eng = TradingEngine(cfg, broker=PaperBroker(10_000), news=_StubCtx(0.0), positioning=None)
     eng.step()
     eng.step()
@@ -237,7 +241,7 @@ def test_engine_cycle(tmp_path):
 
 def test_engine_respects_kill_switch(tmp_path):
     (tmp_path / "STOP").write_text("")
-    cfg = Config(state_dir=str(tmp_path), instruments=[XAU], history_bars=400)
+    cfg = Config(state_dir=str(tmp_path), instruments=[XAU], history_bars=400, calendar_enabled=False)
     cfg.ensemble.entry_threshold = 0.0           # would trade on anything
     eng = TradingEngine(cfg, broker=PaperBroker(10_000), news=_StubCtx(1.0), positioning=None)
     eng.step()
@@ -259,8 +263,98 @@ def test_default_config_loads():
 def test_engine_skips_stale_market(tmp_path, monkeypatch):
     stale = trend_df(400)                         # ends in Jan 2025 -> stale
     monkeypatch.setattr(SyntheticData, "candles", lambda self, *a, **k: stale)
-    cfg = Config(state_dir=str(tmp_path), instruments=[XAU], history_bars=400)
+    cfg = Config(state_dir=str(tmp_path), instruments=[XAU], history_bars=400, calendar_enabled=False)
     cfg.ensemble.entry_threshold = 0.0
     eng = TradingEngine(cfg, broker=PaperBroker(10_000), news=_StubCtx(1.0), positioning=None)
     eng.step()
     assert not eng.broker.positions()
+
+
+# ---- economic calendar ----------------------------------------------------
+
+
+def _calendar(when):
+    cal = EconomicCalendar(minutes_before=30, minutes_after=30)
+    cal.events = [e for e in parse_events([
+        {"title": "Non-Farm Employment Change", "country": "USD", "date": when.isoformat(), "impact": "High"},
+        {"title": "German ZEW", "country": "EUR", "date": "bad-date", "impact": "High"},
+    ])]
+    return cal
+
+
+def test_calendar_blackout_windows():
+    nfp = datetime(2026, 10, 2, 12, 30, tzinfo=timezone.utc)
+    cal = _calendar(nfp)
+    assert len(cal.events) == 1                                   # bad date skipped
+    assert cal.blackout(EUR, nfp - timedelta(minutes=20)).title.startswith("Non-Farm")
+    assert cal.blackout(XAU, nfp + timedelta(minutes=29)) is not None   # gold reacts to USD data
+    assert cal.blackout(BTC, nfp) is not None
+    assert cal.blackout(EUR, nfp - timedelta(minutes=31)) is None
+    assert cal.blackout(EUR, nfp + timedelta(minutes=31)) is None
+    gbpjpy = Instrument("GBP/JPY", AssetClass.FOREX, "synthetic", "GBPJPY", "GBP_JPY")
+    assert cal.blackout(gbpjpy, nfp) is None                      # no USD exposure
+    assert [e.title for e in cal.upcoming(EUR, nfp - timedelta(hours=2))] == ["Non-Farm Employment Change"]
+
+
+def test_engine_respects_calendar_blackout(tmp_path):
+    cfg = Config(state_dir=str(tmp_path), instruments=[XAU], history_bars=400)
+    cfg.ensemble.entry_threshold = 0.0
+    eng = TradingEngine(cfg, broker=PaperBroker(10_000), news=_StubCtx(1.0), positioning=None,
+                        calendar=_calendar(datetime.now(timezone.utc)))
+    eng.calendar.update = lambda *a, **k: None
+    eng.step()
+    assert not eng.broker.positions()
+
+
+# ---- LLM news -------------------------------------------------------------
+class _FakeClient:
+    def __init__(self, payload=None, stop_reason="end_turn", fail=False):
+        self.calls = []
+        self.payload, self.stop_reason, self.fail = payload, stop_reason, fail
+        self.beta = SimpleNamespace(messages=SimpleNamespace(create=self._create))
+
+    def _create(self, **kw):
+        self.calls.append(kw)
+        if self.fail:
+            raise ConnectionError("down")
+        return SimpleNamespace(stop_reason=self.stop_reason,
+                               content=[SimpleNamespace(type="text", text=json.dumps(self.payload))])
+
+
+
+def test_llm_scorer_parses_caches_and_clamps():
+    payload = {"results": [
+        {"id": 0, "scores": [{"asset": "BTC", "sentiment": 0.0}]},
+        {"id": 1, "scores": [{"asset": "USD", "sentiment": 0.8}, {"asset": "XAU", "sentiment": -3}]},
+        {"id": 7, "scores": [{"asset": "EUR", "sentiment": 1}]},          # out of range id ignored
+    ]}
+    client = _FakeClient(payload)
+    llm = LLMNewsScorer(client=client)
+    titles = ["Bitcoin stuck in range", "US CPI hotter than expected", "Local bakery opens"]
+    out = llm.score(titles)
+    assert out["US CPI hotter than expected"] == {"USD": 0.8, "XAU": -1.0}
+    assert out["Local bakery opens"] == {}                               # skipped -> neutral
+    req = client.calls[0]
+    assert req["output_config"]["format"]["type"] == "json_schema"
+    assert req["fallbacks"] == "default"
+    llm.score(titles)
+    assert len(client.calls) == 1                                        # cached
+
+
+def test_llm_failure_falls_back_to_lexicon():
+    na = NewsAnalyzer(feeds=[], llm=LLMNewsScorer(client=_FakeClient(fail=True)))
+    na.headlines = {"Gold soars": Headline("Gold soars", datetime.now(timezone.utc), "t")}
+    na.llm.score(list(na.headlines))
+    assert na.score("Gold soars")["XAU"] > 0                             # lexicon used
+    refused = LLMNewsScorer(client=_FakeClient({"results": []}, stop_reason="refusal"))
+    assert refused.score(["Gold soars"]) == {}
+
+
+def test_llm_overrides_lexicon():
+    payload = {"results": [{"id": 0, "scores": [{"asset": "XAU", "sentiment": 0.6}]}]}
+    title = "Gold prices reversed course after a midweek drop"
+    na = NewsAnalyzer(feeds=[], llm=LLMNewsScorer(client=_FakeClient(payload)))
+    assert score_headline(title)["XAU"] < 0                              # lexicon gets it wrong
+    na.headlines = {title: Headline(title, datetime.now(timezone.utc), "t")}
+    na.llm.score([title])
+    assert na.signal(XAU).score > 0

@@ -25,7 +25,14 @@ class Config:
     news_enabled: bool = True
     news_feeds: list[str] | None = None
     news_half_life_hours: float = 6.0
+    news_llm_enabled: bool = True             # used only if `anthropic` is installed + credentials set
+    news_llm_model: str = "claude-opus-5-5"
+    news_llm_effort: str = "low"
     positioning_enabled: bool = True
+    calendar_enabled: bool = True
+    calendar_minutes_before: int = 30
+    calendar_minutes_after: int = 30
+    calendar_impacts: tuple[str, ...] = ("High",)
     brokers: dict[str, str] = field(default_factory=lambda: {
         "metal": "oanda", "forex": "oanda", "crypto": "ccxt"})
 
@@ -58,6 +65,15 @@ def load_config(path: str | Path = "config.yaml") -> Config:
     cfg.news_enabled = news.get("enabled", True)
     cfg.news_feeds = news.get("feeds")
     cfg.news_half_life_hours = news.get("half_life_hours", 6.0)
+    llm = news.get("llm", {})
+    cfg.news_llm_enabled = llm.get("enabled", True)
+    cfg.news_llm_model = llm.get("model", cfg.news_llm_model)
+    cfg.news_llm_effort = llm.get("effort", cfg.news_llm_effort)
     cfg.positioning_enabled = raw.get("positioning", {}).get("enabled", True)
+    cal = raw.get("calendar", {})
+    cfg.calendar_enabled = cal.get("enabled", True)
+    cfg.calendar_minutes_before = cal.get("minutes_before", 30)
+    cfg.calendar_minutes_after = cal.get("minutes_after", 30)
+    cfg.calendar_impacts = tuple(cal.get("impacts", ("High",)))
     cfg.brokers = {**cfg.brokers, **raw.get("brokers", {})}
     return cfg

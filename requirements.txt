@@ -3,6 +3,8 @@ pandas>=2.1
 requests>=2.31
 PyYAML>=6.0
 defusedxml>=0.7
+# optional: Claude news scoring (needs ANTHROPIC_API_KEY)
+# anthropic>=1.0
 # optional: live crypto trading
 # ccxt>=4.3
 # dev

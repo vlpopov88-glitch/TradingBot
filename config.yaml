@@ -49,6 +49,9 @@ positioning:
   enabled: true               # CFTC COT for gold/FX: fades speculators' recent flow
   crypto: false               # OKX trader ratios/funding: unproven (only ~100 days of history)
 
+notify:                       # Telegram alerts: set TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID (see .env.example)
+  daily_summary_hour_utc: 21
+
 calendar:                     # no new entries around high-impact releases (NFP, CPI, FOMC...)
   enabled: true
   minutes_before: 30

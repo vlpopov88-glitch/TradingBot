@@ -34,6 +34,7 @@ class Config:
     calendar_minutes_before: int = 30
     calendar_minutes_after: int = 30
     calendar_impacts: tuple[str, ...] = ("High",)
+    notify_summary_hour: int = 21             # UTC hour for the daily Telegram summary
     brokers: dict[str, str] = field(default_factory=lambda: {
         "metal": "oanda", "forex": "oanda", "crypto": "ccxt"})
 
@@ -77,5 +78,6 @@ def load_config(path: str | Path = "config.yaml") -> Config:
     cfg.calendar_minutes_before = cal.get("minutes_before", 30)
     cfg.calendar_minutes_after = cal.get("minutes_after", 30)
     cfg.calendar_impacts = tuple(cal.get("impacts", ("High",)))
+    cfg.notify_summary_hour = raw.get("notify", {}).get("daily_summary_hour_utc", 21)
     cfg.brokers = {**cfg.brokers, **raw.get("brokers", {})}
     return cfg

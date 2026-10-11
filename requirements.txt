@@ -7,5 +7,3 @@ defusedxml>=0.7
 # anthropic>=1.0
 # optional: live crypto trading
 # ccxt>=4.3
-# dev
-pytest>=8

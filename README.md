@@ -1,98 +1,130 @@
-# TradingBot — XAU/USD, Forex & Crypto
+# TradingBot: XAU/USD, Forex & Crypto
 
-An automated trading bot that continuously:
+An automated trading bot for gold, major FX pairs and crypto. It analyzes markets, news and other traders' positioning around the clock, and trades with strict risk limits. It runs in **paper mode (simulated money) by default.**
 
-1. **Runs technical strategies**: trend following (EMA 20/50/200), momentum (MACD + ROC), Donchian breakout, and mean reversion (RSI + Bollinger). It blends them according to the market regime detected by ADX: trend strategies get more weight in trending markets and mean reversion more in ranging ones.
-2. **Analyzes news**: it polls RSS feeds (Investing.com, Cointelegraph, MarketWatch, Google News) and scores every headline per asset and currency. Older headlines count less (exponential decay). For a pair, the score is `sentiment(base) − sentiment(quote)`.
-   - **With `ANTHROPIC_API_KEY` set** (and `pip install anthropic`): Claude reads the headlines in batches and returns the expected direction for each affected asset, including second-order effects such as hot US CPI → stronger USD → weaker gold. Each headline is scored once and cached, so steady-state cost is only the few new headlines per refresh. The model and effort level are set in `config.yaml` under `news.llm`.
-   - **Without it, or if a call fails:** a keyword lexicon covering hawkish/dovish central-bank tone and safe-haven flows. It works, but misreads context (e.g. "Bitcoin stuck in range").
-3. **Watches other traders**:
-   - **Gold & forex:** CFTC Commitments of Traders. The bot ranks large speculators' net position against the last 3 years. It follows their flows in the mid-range and fades them at crowded extremes.
-   - **Crypto:** OKX top-trader long/short ratio (follow the "smart money"), all-accounts ratio (fade the retail crowd) and the funding rate (fade over-leveraged positioning).
-4. **Manages risk**:
-   - Each trade risks 1% of equity, with an ATR-based stop, a 2R take-profit and a trailing stop.
-   - Leverage caps per asset class, plus limits on open positions in total and per class.
-   - A daily-loss circuit breaker and a max-drawdown halt.
-   - No trading on stale data (weekends and holidays).
-   - **Economic-calendar blackout:** no new entries 30 minutes before to 30 minutes after high-impact releases (NFP, CPI, FOMC, ...) for the affected currencies. Gold and crypto count as USD-exposed. Events come from the Forex Factory weekly feed.
-   - A kill switch file.
-5. **Executes**: in paper mode by default. In live mode it routes gold and FX to **OANDA** and crypto to any **CCXT** exchange.
+> ⚠️ **Read this first.** No bot guarantees profit, and most retail algorithmic traders lose money. Every default in this bot was tested on years of real data (see [docs/RESEARCH.md](docs/RESEARCH.md)). The edge it found is **small**: about +4% per market over 5 years out of sample. Paper trade for weeks before considering real money, and only ever risk money you can afford to lose. This is software, not financial advice.
 
-Every decision, trade and equity point goes into a SQLite journal (`state/journal.db`).
+## Накратко на български
 
-> ⚠️ **Read this first.** No bot guarantees profit, and most retail algorithmic traders lose money. The backtests below show the technical layer **does not have a reliable edge as shipped**. Run it in paper mode for weeks, study the journal and improve it before you put real money in. Trade only money you can afford to lose. This is software, not financial advice.
+**Какво прави ботът:** На всеки 5 минути проверява злато (XAU/USD), EUR/USD, GBP/USD, USD/JPY, BTC и ETH.
+- Следи тенденцията на дневни свещи.
+- Чете новините (с Claude, ако има API ключ).
+- Гледа позициите на големите спекуланти от отчетите на CFTC и залага *срещу* тяхното трупане, защото историческите данни показват, че те влизат късно.
+- Спира новите сделки около важни икономически новини.
+- Всяка сделка рискува най-много 1% от сметката.
 
-## Quick start
-
+**Как да го пуснете 24/7 на сървър (VPS):**
 ```bash
-pip install -r requirements.txt
-
-python -m tradingbot analyze      # what the bot thinks of every market right now
-python -m tradingbot news         # scored headlines
-python -m tradingbot backtest     # test the technical strategies on real history
-python -m tradingbot run          # start paper trading (loops every 5 min)
-python -m tradingbot status       # P&L summary and recent trades
-python -m tradingbot flatten      # close everything
+git clone https://github.com/vlpopov88-glitch/TradingBot.git && cd TradingBot
+cp .env.example .env          # по желание: Telegram и API ключове
+docker compose up -d --build  # стартира и рестартира автоматично
+docker compose logs -f        # какво прави в момента
+docker compose run --rm tradingbot status   # печалба/загуба и сделки
 ```
+**Известия на телефона:** създайте Telegram бот чрез @BotFather и попълнете `TELEGRAM_BOT_TOKEN` и `TELEGRAM_CHAT_ID` в `.env` (подробно в `tradingbot/notify.py`). Ще получавате съобщение при всяка сделка, при спиране на търговията и дневно обобщение.
 
-To block new entries immediately, run `touch state/STOP`. Delete the file to resume.
+**След 2–4 седмици:** пуснете `docker compose run --rm tradingbot evaluate`. Командата измерва кои сигнали (новини, позиции, техника) реално са предсказвали цената, за да коригираме тежестите им.
 
-Example `analyze` output:
+## What it does
 
-```
-XAU/USD @ 4216.3  ->  HOLD  (score +0.11)
-   technical       +0.16  conf 1.00  trending market (ADX 40)
-   news            +0.09  conf 0.69  3.5 weighted headlines; e.g. 'Gold Price Outlook: ...'
-   positioning     -0.19  conf 0.60  COT index 86%, net +53.1% of OI, 4wk chg -3.3%
-   trend           +0.68  ...
-```
+1. **Technical analysis on daily bars:** trend (EMA 20/50/200), momentum (MACD + ROC) and Donchian breakout. Mean reversion is also available. Research showed that on hourly and 4-hour bars these markets mean-revert and every trend signal pointed the wrong way, so daily is the default.
+2. **News:** RSS feeds (Investing.com, Cointelegraph, MarketWatch, Google News) are scored per asset and currency, with older headlines counting less. For a pair the score is `sentiment(base) − sentiment(quote)`.
+   - **With `ANTHROPIC_API_KEY` set:** Claude reads the headlines and understands second-order effects (hot US CPI → stronger USD → weaker gold). Each headline is scored once and cached.
+   - **Otherwise:** a keyword lexicon. It works, but it is crude.
+3. **Watching other traders:**
+   - **Gold & FX:** CFTC Commitments of Traders, weekly. The bot **fades** large speculators' 4-week flow and their crowded extremes. Following their flow was reliably wrong over 10 years (IC −0.07, t −3.1).
+   - **Crypto:** OKX top-trader/crowd ratios and funding. **Off by default**: the only ~100 days of history pointed the wrong way, which is too little data to trust either direction.
+4. **Risk management:**
+   - 1% of equity at risk per trade, with an ATR stop, a 2R target and a trailing stop.
+   - Stops are evaluated bar by bar, never against an earlier low.
+   - Leverage caps, plus position limits in total and per asset class.
+   - A 2-bar cooldown after an exit.
+   - A daily-loss limit (3%) and a max-drawdown halt (15%). Both survive restarts and are lifted with `tradingbot resume`.
+   - No trading on stale prices (weekends, holidays, dead feeds).
+   - **Economic-calendar blackout:** no new entries from 30 minutes before to 30 minutes after high-impact releases (NFP, CPI, FOMC…).
+   - A kill-switch file.
+5. **Execution:** paper by default. Live mode sends gold and FX to **OANDA** and crypto to any **CCXT** exchange.
+6. **Self-measurement:** every signal is journaled once per bar. `tradingbot evaluate` scores each one against what the price did next.
 
 ## How a decision is made
 
 ```
-technical (regime-weighted blend of 4 strategies) ──┐ 0.60
-news sentiment (decayed, per currency/asset)  ──────┼ 0.25 × confidence ──► score ∈ [-1, 1]
-trader positioning (COT / OKX)               ───────┘ 0.15 × confidence
+technical (trend + momentum + breakout, daily)  ─┐ 0.5
+trader positioning (fade COT speculator flow)   ─┼ 0.3 × confidence ──► score ∈ [-1, 1]
+news sentiment (Claude or keywords)              ─┘ 0.2 × confidence
 score ≥ +0.35 → BUY · score ≤ −0.35 → SELL · open trade & score flips past 0.10 → CLOSE
 ```
 
-Everything above is configurable in `config.yaml`: weights, thresholds, risk limits, markets and timeframe.
+Weights, thresholds, strategies, risk limits, markets and timeframe are all set in `config.yaml`.
+
+## Run it 24/7 (Docker)
+
+On any small Linux server (1 GB RAM is plenty) with Docker installed:
+
+```bash
+cp .env.example .env               # optional: Telegram, Claude, broker keys
+docker compose up -d --build       # starts now and after every reboot
+docker compose logs -f             # live log
+docker compose run --rm tradingbot status     # P&L and recent trades
+docker compose exec tradingbot touch /app/state/STOP   # kill switch: no new entries
+docker compose down                # stop (state is kept in a Docker volume)
+```
+
+The container runs as a non-root user and has a health check: it reports *unhealthy* if no cycle has completed for 20 minutes. If Docker Hub rate-limits your server, build from a mirror: `docker build --build-arg BASE=mirror.gcr.io/library/python:3.12-slim .`
+
+Without Docker: `pip install -r requirements.txt`, then `python -m tradingbot run`.
+
+## Phone alerts (Telegram)
+
+1. In Telegram, message **@BotFather**, send `/newbot` and copy the token.
+2. Send your new bot any message. Then open `https://api.telegram.org/bot<TOKEN>/getUpdates` and copy the number after `"chat":{"id":`.
+3. Put `TELEGRAM_BOT_TOKEN=…` and `TELEGRAM_CHAT_ID=…` in `.env`, then run `python -m tradingbot notify-test`.
+
+You'll get a message for every opened and closed trade (with P&L), when trading halts, when cycles keep failing, and a daily summary at 21:00 UTC (configurable).
+
+## Commands
+
+```bash
+python -m tradingbot run             # trading loop (paper by default)
+python -m tradingbot analyze         # what the bot thinks of every market right now
+python -m tradingbot news            # scored headlines
+python -m tradingbot status          # P&L summary and recent trades
+python -m tradingbot evaluate        # which live signals actually predicted prices
+python -m tradingbot research        # measure every signal on years of history
+python -m tradingbot backtest        # backtest the current config (daily bars + COT)
+python -m tradingbot resume          # lift a loss/drawdown halt after review
+python -m tradingbot notify-test     # check Telegram alerts
+python -m tradingbot flatten         # close everything
+```
+
+## What the research found
+
+Full tables and method are in [docs/RESEARCH.md](docs/RESEARCH.md). Every choice below was made on 2016–2021 data and then checked on the unseen 2021–2026 data.
+
+| Setup (daily bars, 6 markets) | Avg. return per market, Oct 2021 – Oct 2026 | Markets up |
+|---|---|---|
+| Original design (4-strategy blend + follow speculators) | −1.3% | 2/6 |
+| Trend strategies only | +2.4% | 4/6 |
+| **Current default (trend + fade speculators)** | **+4.0%** | 4/6 |
+
+On hourly and 4-hour bars, every technical variant lost money out of sample. Don't switch to them expecting more profit.
 
 ## Markets (default)
 
-| Market  | Data                | Positioning           | Live broker |
-|---------|---------------------|-----------------------|-------------|
-| XAU/USD | Yahoo `GC=F`        | CFTC gold (088691)    | OANDA `XAU_USD` |
+| Market | Data | Positioning | Live broker |
+|---|---|---|---|
+| XAU/USD | Yahoo `GC=F` | CFTC gold (088691) | OANDA `XAU_USD` |
 | EUR/USD, GBP/USD, USD/JPY | Yahoo | CFTC currency futures | OANDA |
-| BTC/USD, ETH/USD | OKX spot   | OKX top traders, crowd, funding | CCXT (spot, long only) |
+| BTC/USD, ETH/USD | OKX spot | off by default | CCXT (spot, long only) |
 
-To add a market, add an entry under `instruments:`. Only USD-quoted or USD-based pairs are supported for position sizing.
+To add a market, add an entry under `instruments:`. Position sizing supports only pairs that are USD-quoted or USD-based.
 
-## Going live (only after paper trading)
+## Going live (only after weeks of paper trading)
 
-1. Copy `.env.example` to `.env`, fill in your keys and export them.
-2. **OANDA:** start with `OANDA_ENV=practice` (a free demo account). Stops and targets are attached server-side, so they protect you even if the bot crashes.
-3. **Crypto:** run `pip install ccxt`. Set `CCXT_SANDBOX=1` (testnet) first. On spot markets the bot only goes long, and the bot itself manages the stops.
-4. Set `mode: live` in `config.yaml` and run `python -m tradingbot run --confirm-live`.
-
-The API keys you create should have **trading permission only, never withdrawal permission**.
-
-## Backtest results (honest)
-
-Real data, technical layer only (no news or positioning history), 1% risk per trade, with spread costs:
-
-| Market | 1h bars (~4 months) | 4h bars (~1 year) |
-|--------|--------------------|-------------------|
-| XAU/USD | −5.1% | +7.3% |
-| EUR/USD | −7.7% | +3.7% |
-| GBP/USD | −4.0% | −6.2% |
-| USD/JPY | −9.0% | −5.9% |
-| BTC/USD | −3.3% | −2.7% |
-| ETH/USD | +6.2% | −7.7% |
-
-Conclusion: textbook indicators alone are not an edge. Don't tune parameters until these numbers turn green. That's overfitting, and it falls apart live. Better next steps:
-- Collect a few weeks of journal data. Measure whether the news and positioning signals actually predict returns, then adjust the weights.
-- Walk-forward / out-of-sample testing for any change.
+1. Put your keys in `.env`. API keys need **trading permission only, never withdrawal**.
+2. **OANDA:** start with `OANDA_ENV=practice` (a free demo account). Stops and targets sit on OANDA's servers, so they protect you even if the bot is down.
+3. **Crypto:** `pip install ccxt`, with `CCXT_SANDBOX=1` (testnet) first. On spot markets the bot goes long only and manages stops itself.
+4. Set `mode: live` in `config.yaml` and run `python -m tradingbot run --confirm-live`. With Docker, change the compose `command` to `["run", "--confirm-live"]`.
 
 ## Project layout
 
@@ -100,15 +132,18 @@ Conclusion: textbook indicators alone are not an edge. Don't tune parameters unt
 tradingbot/
   data/market.py   Yahoo, OKX, OANDA and synthetic candle providers
   indicators.py    EMA, RSI, ATR, ADX, MACD, Bollinger, Donchian
-  strategies.py    4 strategies + regime-aware ensemble
+  strategies.py    strategies (per-bar score series) + regime-aware ensemble
   news.py          RSS ingestion + keyword sentiment
   llm_news.py      Claude headline scoring (optional)
+  positioning.py   CFTC COT + OKX crypto positioning
   econ_calendar.py high-impact event blackout
-  positioning.py   CFTC COT + OKX crypto trader positioning
-  risk.py          sizing, stops, trailing, limits, circuit breakers
+  risk.py          sizing, stops, trailing, limits, persistent circuit breakers
   brokers/         paper, OANDA, CCXT, router
   engine.py        the live loop
-  backtest.py      bar-by-bar backtester
-  journal.py       SQLite journal
-tests/             pytest suite (python -m pytest)
+  backtest.py      bar-by-bar backtester (supports dated context signals)
+  research.py      signal research and live-signal evaluation
+  notify.py        Telegram alerts
+  journal.py       SQLite journal (trades, equity, per-bar signal snapshots)
+docs/RESEARCH.md   what was tested and what was found
+tests/             pytest suite: pip install -r requirements-dev.txt && python -m pytest
 ```

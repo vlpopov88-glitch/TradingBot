@@ -1,0 +1,19 @@
+# Start (and keep running, also after reboots):  docker compose up -d --build
+# Live log:                                      docker compose logs -f
+# P&L and trades:                                docker compose run --rm tradingbot status
+# Signal research / live evaluation:             docker compose run --rm tradingbot evaluate
+# Pause new entries (kill switch):               docker compose exec tradingbot touch /app/state/STOP
+# Stop:                                          docker compose down   (state is kept)
+services:
+  tradingbot:
+    build: .
+    restart: unless-stopped
+    env_file:
+      - path: .env          # API keys / Telegram token; optional
+        required: false
+    volumes:
+      - botstate:/app/state                   # paper account, journal, logs (Docker-managed)
+      - ./config.yaml:/app/config.yaml:ro     # edit config.yaml, then: docker compose restart
+
+volumes:
+  botstate:

@@ -496,3 +496,52 @@ def test_evaluate_journal_separates_signal_from_noise(tmp_path, monkeypatch):
     by = {(s.source, s.horizon): s for s in pooled}
     assert by[("oracle", "4h")].ic > 0.5 and research.verdict(by[("oracle", "4h")]) == "PREDICTIVE"
     assert abs(by[("noise", "4h")].ic) < 0.2
+
+
+# ---- notifications & resilience ---------------------------------------------
+def test_notifier_never_logs_token(monkeypatch, caplog):
+    from tradingbot import notify
+    secret = "123456:SECRET-TOKEN"
+
+    def boom(url, **kw):
+        raise ConnectionError(f"failed to reach {url}")          # real errors embed the URL
+
+    monkeypatch.setattr(notify, "session", lambda: SimpleNamespace(post=boom))
+    n = notify.Notifier(token=secret, chat_id="42")
+    with caplog.at_level("WARNING"):
+        assert n.send("hello") is False
+    assert "SECRET" not in caplog.text and "ConnectionError" in caplog.text
+    assert notify.Notifier(token="", chat_id="").send("x") is False   # disabled: no request
+
+
+def test_engine_alerts_trades_halts_and_summary(tmp_path):
+    from tradingbot.notify import Notifier
+    cfg = Config(state_dir=str(tmp_path), instruments=[XAU], history_bars=400, calendar_enabled=False)
+    cfg.ensemble.entry_threshold = 0.0
+    cfg.notify_summary_hour = 0
+    note = Notifier(token="", chat_id="")
+    eng = TradingEngine(cfg, broker=PaperBroker(10_000), news=_StubCtx(1.0), positioning=None, notifier=note)
+    eng.step()
+    assert any(m.startswith("🟢 OPEN") for m in note.sent)
+    assert sum(m.startswith("📊 Daily summary") for m in note.sent) == 1
+    eng._close(XAU, eng.prices["XAU/USD"], "test")
+    assert any("CLOSE" in m and "P&L" in m for m in note.sent)
+    eng.risk.day_start_equity = 50_000                      # pretend we started the day far higher
+    eng.step()
+    assert any(m.startswith("⛔") and "daily loss" in m for m in note.sent)
+    assert sum(m.startswith("📊 Daily summary") for m in note.sent) == 1   # once per day
+    assert (tmp_path / "heartbeat").exists()
+
+
+def test_run_loop_survives_failing_cycle(tmp_path):
+    from tradingbot.notify import Notifier
+    cfg = Config(state_dir=str(tmp_path), instruments=[XAU], calendar_enabled=False)
+    eng = TradingEngine(cfg, broker=PaperBroker(10_000), news=_StubCtx(0), positioning=None,
+                        notifier=Notifier(token="", chat_id=""))
+
+    def broken():
+        raise ConnectionError("broker down")
+
+    eng.step = broken
+    eng.run(once=True)                                      # must not raise
+    assert eng._failures == 1

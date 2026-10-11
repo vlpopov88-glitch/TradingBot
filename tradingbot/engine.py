@@ -17,6 +17,7 @@ from .econ_calendar import EconomicCalendar
 from .journal import Journal
 from .models import Decision, Instrument, Side, Signal
 from .news import NewsAnalyzer
+from .notify import Notifier
 from .positioning import PositioningAnalyzer
 from .risk import RiskManager
 from .strategies import Ensemble
@@ -72,7 +73,7 @@ def make_broker(cfg: Config) -> Broker:
 class TradingEngine:
     def __init__(self, cfg: Config, broker: Broker | None = None, journal: Journal | None = None,
                  news: NewsAnalyzer | None = None, positioning: PositioningAnalyzer | None = None,
-                 calendar: EconomicCalendar | None = None):
+                 calendar: EconomicCalendar | None = None, notifier: Notifier | None = None):
         self.cfg = cfg
         self.instruments = cfg.by_name
         os.makedirs(cfg.state_dir, exist_ok=True)
@@ -89,8 +90,12 @@ class TradingEngine:
         self.prices: dict[str, float] = {}
         self.last_exit: dict[str, pd.Timestamp] = {}
         self.stale: dict[str, bool] = {}
+        self.notifier = notifier or Notifier(prefix="[paper] " if cfg.mode == "paper" else "")
         self._running = True
+        self._failures = 0
+        self._summary_day = None
         self.kill_file = os.path.join(cfg.state_dir, "STOP")
+        self.heartbeat_file = os.path.join(cfg.state_dir, "heartbeat")
 
     # ---- analysis ---------------------------------------------------------
     def context_signals(self, inst: Instrument) -> list[Signal]:
@@ -135,6 +140,7 @@ class TradingEngine:
             log.info("broker closed %s: pnl %.2f (%s)", t.instrument, t.pnl_usd, t.reason)
             self.journal.trade(t)
             self.last_exit[t.instrument] = pd.Timestamp.now(tz="UTC")
+            self._notify_close(t)
 
         for inst in self.instruments.values():
             try:
@@ -144,11 +150,34 @@ class TradingEngine:
 
         positions = self.broker.positions()
         eq = self.broker.equity(self.prices)
+        was_halted = self.risk.halted_reason
         self.risk.on_equity(eq)
+        if self.risk.halted_reason and self.risk.halted_reason != was_halted:
+            self.notifier.send(f"⛔ New trades halted: {self.risk.halted_reason}. Equity {eq:,.2f}. "
+                               "Open positions keep their stops. Review, then run `python -m tradingbot resume`.")
         self.journal.equity(eq, len(positions))
         log.info("equity %.2f | open: %s%s", eq,
                  ", ".join(f"{n} {p.side.value} {p.qty:g}@{p.entry_price:.5g}" for n, p in positions.items()) or "none",
                  f" | HALTED: {self.risk.halted_reason}" if self.risk.halted_reason else "")
+        self._daily_summary(eq, positions)
+        with open(self.heartbeat_file, "w") as f:
+            f.write(datetime.now(timezone.utc).isoformat())
+
+    def _daily_summary(self, equity: float, positions) -> None:
+        now = datetime.now(timezone.utc)
+        if now.hour < self.cfg.notify_summary_hour or self._summary_day == now.date():
+            return
+        self._summary_day = now.date()
+        start = self.risk.day_start_equity or equity
+        today = [t for t in self.journal.recent_trades(200) if t[0][:10] == now.date().isoformat()]
+        lines = [f"📊 Daily summary {now:%Y-%m-%d}",
+                 f"Equity {equity:,.2f} ({equity / start - 1:+.2%} today)",
+                 f"Closed today: {len(today)} trade(s), P&L {sum(t[6] for t in today):+,.2f}"]
+        lines += [f"Open: {n} {p.side.value} {p.qty:g} @ {p.entry_price:.5g} (SL {p.stop_loss:.5g})"
+                  for n, p in positions.items()] or ["No open positions"]
+        if self.risk.halted_reason:
+            lines.append(f"⛔ Halted: {self.risk.halted_reason}")
+        self.notifier.send("\n".join(lines))
 
     def _step_instrument(self, inst: Instrument) -> None:
         res = self.analyze(inst)
@@ -200,9 +229,12 @@ class TradingEngine:
                 return
             pos = self.broker.open(inst, side, qty, price, sl, tp)
             if pos:
+                why = "; ".join(f"{s.source} {s.score:+.2f}" for s in decision.signals[:3])
                 log.info("OPEN %s %s %g @ %.5g  SL %.5g  TP %.5g  score %+.2f  [%s]",
-                         side.value.upper(), inst.name, pos.qty, pos.entry_price, sl, tp, decision.score,
-                         "; ".join(f"{s.source} {s.score:+.2f}" for s in decision.signals[:3]))
+                         side.value.upper(), inst.name, pos.qty, pos.entry_price, sl, tp, decision.score, why)
+                self.notifier.send(f"🟢 OPEN {side.value.upper()} {inst.name} {pos.qty:g} @ {pos.entry_price:.5g}\n"
+                                   f"Stop {sl:.5g} | Target {tp:.5g} | risk ~{self.cfg.risk.risk_per_trade:.0%}\n"
+                                   f"Score {decision.score:+.2f} ({why})")
         else:
             log.debug("%s: hold (score %+.2f)", inst.name, decision.score)
 
@@ -239,6 +271,12 @@ class TradingEngine:
             log.info("CLOSE %s %s @ %.5g pnl %.2f USD (%s)", t.side.value, inst.name, t.exit_price, t.pnl_usd, reason)
             self.journal.trade(t)
             self.last_exit[inst.name] = pd.Timestamp.now(tz="UTC")
+            self._notify_close(t)
+
+    def _notify_close(self, t) -> None:
+        icon = "✅" if t.pnl_usd > 0 else "🔴"
+        self.notifier.send(f"{icon} CLOSE {t.side.value} {t.instrument} @ {t.exit_price:.5g}\n"
+                           f"P&L {t.pnl_usd:+,.2f} USD ({t.reason})")
 
     def flatten(self, reason: str = "manual flatten") -> None:
         for name in list(self.broker.positions()):
@@ -253,9 +291,21 @@ class TradingEngine:
         signal.signal(signal.SIGTERM, self._stop)
         log.info("starting %s trading on %s (%s bars, every %ss)", self.cfg.mode.upper(),
                  ", ".join(self.instruments), self.cfg.timeframe, self.cfg.loop_seconds)
+        if not once:
+            self.notifier.send(f"🤖 TradingBot started in {self.cfg.mode.upper()} mode: "
+                               f"{', '.join(self.instruments)} ({self.cfg.timeframe} bars)")
         while self._running:
             started = time.time()
-            self.step()
+            try:
+                self.step()
+                self._failures = 0
+            except Exception:
+                # A broker/network outage must not kill a bot that is holding positions.
+                self._failures += 1
+                log.exception("cycle failed (%d in a row)", self._failures)
+                if self._failures in (3, 12, 60):
+                    self.notifier.send(f"⚠️ {self._failures} cycles in a row failed - check the log "
+                                       f"({self.cfg.state_dir}/bot.log). The bot keeps retrying.")
             if once:
                 break
             while self._running and time.time() - started < self.cfg.loop_seconds:

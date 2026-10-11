@@ -156,6 +156,24 @@ def cmd_status(cfg, args):
         print("  ", row)
 
 
+def cmd_resume(cfg, args):
+    """Lift a daily-loss or max-drawdown halt after you have reviewed what happened."""
+    from .risk import RiskManager
+    path = os.path.join(cfg.state_dir, "risk_state.json")
+    rm = RiskManager(cfg.risk, state_file=path)
+    print(f"halt was: {rm.halted_reason or 'none'}")
+    rm.resume()
+    print("trading resumed; the drawdown peak re-bases on the next equity reading")
+
+
+def cmd_notify_test(cfg, args):
+    from .notify import Notifier
+    n = Notifier()
+    if not n.enabled:
+        sys.exit("set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID first (see tradingbot/notify.py)")
+    print("sent" if n.send("✅ TradingBot can reach you on Telegram.") else "failed - check the token/chat id")
+
+
 def cmd_flatten(cfg, args):
     from .engine import TradingEngine
     if cfg.mode == "live" and not args.confirm_live:
@@ -192,6 +210,8 @@ def main(argv=None):
     ev.add_argument("--detail", action="store_true")
     s = sub.add_parser("status", help="journal summary and recent trades")
     s.add_argument("--limit", type=int, default=20)
+    sub.add_parser("resume", help="lift a daily-loss / drawdown halt after review")
+    sub.add_parser("notify-test", help="send a test Telegram message")
     f = sub.add_parser("flatten", help="close all open positions")
     f.add_argument("--confirm-live", action="store_true")
 
@@ -200,7 +220,7 @@ def main(argv=None):
     _setup_logging(cfg.state_dir, args.verbose)
     {"run": cmd_run, "analyze": cmd_analyze, "news": cmd_news, "backtest": cmd_backtest,
      "research": cmd_research, "evaluate": cmd_evaluate, "status": cmd_status,
-     "flatten": cmd_flatten}[args.cmd](cfg, args)
+     "resume": cmd_resume, "notify-test": cmd_notify_test, "flatten": cmd_flatten}[args.cmd](cfg, args)
 
 
 if __name__ == "__main__":
